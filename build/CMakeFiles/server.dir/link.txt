@@ -1,0 +1,1 @@
+/usr/bin/c++  -O3 -DNDEBUG   CMakeFiles/server.dir/server.cpp.o  -o server  /usr/lib/x86_64-linux-gnu/libfmt.a -lpthread 

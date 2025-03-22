@@ -1,0 +1,40 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/guaua/Desktop/co_https/server.cpp
+arpa/inet.h
+-
+fcntl.h
+-
+sys/epoll.h
+-
+sys/socket.h
+-
+sys/types.h
+-
+netdb.h
+-
+unistd.h
+-
+fmt/format.h
+-
+string.h
+-
+thread
+-
+vector
+-
+string
+-
+string_view
+-
+map
+-
+cassert
+-
+

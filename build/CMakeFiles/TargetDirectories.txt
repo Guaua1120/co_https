@@ -1,0 +1,3 @@
+/home/guaua/Desktop/co_https/build/CMakeFiles/rebuild_cache.dir
+/home/guaua/Desktop/co_https/build/CMakeFiles/edit_cache.dir
+/home/guaua/Desktop/co_https/build/CMakeFiles/server.dir
