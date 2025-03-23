@@ -87,3 +87,79 @@ make: *** [Makefile:121：cmTC_505f5/fast] 错误 2
 
 
 
+Determining if the epoll_pwait2 exist failed with the following output:
+Change Dir: /home/guaua/Desktop/co_https/build/CMakeFiles/CMakeTmp
+
+Run Build Command(s):/usr/bin/ninja cmTC_556e8 && [1/2] Building CXX object CMakeFiles/cmTC_556e8.dir/CheckSymbolExists.cxx.o
+FAILED: CMakeFiles/cmTC_556e8.dir/CheckSymbolExists.cxx.o 
+/usr/bin/g++    -std=gnu++17 -o CMakeFiles/cmTC_556e8.dir/CheckSymbolExists.cxx.o -c CheckSymbolExists.cxx
+CheckSymbolExists.cxx: In function ‘int main(int, char**)’:
+CheckSymbolExists.cxx:8:19: error: ‘epoll_pwait2’ was not declared in this scope; did you mean ‘epoll_pwait’?
+    8 |   return ((int*)(&epoll_pwait2))[argc];
+      |                   ^~~~~~~~~~~~
+      |                   epoll_pwait
+ninja: build stopped: subcommand failed.
+
+
+File /home/guaua/Desktop/co_https/build/CMakeFiles/CMakeTmp/CheckSymbolExists.cxx:
+/* */
+#include <sys/epoll.h>
+
+int main(int argc, char** argv)
+{
+  (void)argv;
+#ifndef epoll_pwait2
+  return ((int*)(&epoll_pwait2))[argc];
+#else
+  (void)argc;
+  return 0;
+#endif
+}
+Performing C++ SOURCE FILE Test CMAKE_HAVE_LIBC_PTHREAD failed with the following output:
+Change Dir: /home/guaua/Desktop/co_https/build/CMakeFiles/CMakeTmp
+
+Run Build Command(s):/usr/bin/ninja cmTC_f9d31 && [1/2] Building CXX object CMakeFiles/cmTC_f9d31.dir/src.cxx.o
+[2/2] Linking CXX executable cmTC_f9d31
+FAILED: cmTC_f9d31 
+: && /usr/bin/g++  -DCMAKE_HAVE_LIBC_PTHREAD   CMakeFiles/cmTC_f9d31.dir/src.cxx.o  -o cmTC_f9d31   && :
+/usr/bin/ld: CMakeFiles/cmTC_f9d31.dir/src.cxx.o: in function `main':
+src.cxx:(.text+0x46): undefined reference to `pthread_create'
+/usr/bin/ld: src.cxx:(.text+0x52): undefined reference to `pthread_detach'
+/usr/bin/ld: src.cxx:(.text+0x63): undefined reference to `pthread_join'
+collect2: error: ld returned 1 exit status
+ninja: build stopped: subcommand failed.
+
+
+Source file was:
+#include <pthread.h>
+
+void* test_func(void* data)
+{
+  return data;
+}
+
+int main(void)
+{
+  pthread_t thread;
+  pthread_create(&thread, NULL, test_func, NULL);
+  pthread_detach(thread);
+  pthread_join(thread, NULL);
+  pthread_atfork(NULL, NULL, NULL);
+  pthread_exit(NULL);
+
+  return 0;
+}
+
+Determining if the function pthread_create exists in the pthreads failed with the following output:
+Change Dir: /home/guaua/Desktop/co_https/build/CMakeFiles/CMakeTmp
+
+Run Build Command(s):/usr/bin/ninja cmTC_ca993 && [1/2] Building CXX object CMakeFiles/cmTC_ca993.dir/CheckFunctionExists.cxx.o
+[2/2] Linking CXX executable cmTC_ca993
+FAILED: cmTC_ca993 
+: && /usr/bin/g++  -DCHECK_FUNCTION_EXISTS=pthread_create   CMakeFiles/cmTC_ca993.dir/CheckFunctionExists.cxx.o  -o cmTC_ca993  -lpthreads && :
+/usr/bin/ld: 找不到 -lpthreads
+collect2: error: ld returned 1 exit status
+ninja: build stopped: subcommand failed.
+
+
+

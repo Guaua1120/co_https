@@ -1,0 +1,7 @@
+[
+{
+  "directory": "/home/guaua/Desktop/co_https/build",
+  "command": "/usr/bin/g++  -DFMT_LOCALE -I../include  -g   -Wall -Wextra -Werror=return-type -std=gnu++17 -o CMakeFiles/server.dir/server.cpp.o -c /home/guaua/Desktop/co_https/server.cpp",
+  "file": "/home/guaua/Desktop/co_https/server.cpp"
+}
+]
