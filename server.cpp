@@ -15,25 +15,6 @@
 #include <cassert>
 
 
-int check_error(const char* msg,int res){
-    if(res==-1){
-        fmt::print("{}: {}\n",msg ,strerror(errno));
-        throw;
-    }
-    return res;
-}
-
-size_t check_error(const char* msg,ssize_t res){
-    if(res==-1){
-        fmt::print("{}: {}\n",msg ,strerror(errno));
-        throw;
-    }
-    return res;
-}
-
-//宏定义（Macro），简化函数调用时的错误检查，并自动捕获函数名和返回值进行统一处理
-#define CHECK_CALL(func, ...) check_error(#func, func(__VA_ARGS__))
-
 std::error_category const &gai_category() {
     static struct final : std::error_category {
         char const *name() const noexcept override {
@@ -46,6 +27,43 @@ std::error_category const &gai_category() {
     } instance;
     return instance;
 }
+
+
+[[noreturn]] void _throw_system_error(const char *what) {
+    auto ec = std::error_code(errno, std::system_category());
+    fmt::print(stderr, "{}: {} ({}.{})\n", what, ec.message(), ec.category().name(), ec.value());
+    throw std::system_error(ec, what);
+}
+
+// errno 是一个在 C/C++ 中常见的全局变量，用于表示最近一次系统调用或标准库函数发生的错误编号。
+// 默认模板参数 Except，表示某个允许“忽略”的错误号（errno 值）。
+template <int Except =0,class T>
+T check_error(const char* what ,T res){
+    if(res==-1){
+        if constexpr(Except !=0){
+            if(errno == Except){
+                //说明是我们可以接受的错误类型，就不报错，直接返回
+                return -1;
+            }
+        }
+        auto ec = std::error_code(errno,std::system_category());
+        fmt::print(stderr,"{}: {}\n",what,ec.message());
+        _throw_system_error(what);
+    }
+    return res;
+}
+
+
+//宏定义
+//优化错误处理，输出具体的文件和行号信息
+#define SOURCE_INFO_IMPL(file,line) "In " file ":" #line ": "
+//传入两个预定义宏，表示源文件名和代码行号
+#define SOURCE_INFO() SOURCE_INFO_IMPL(__FILE__,__LINE__)
+//简化函数调用时的错误检查，并自动捕获函数名和返回值进行统一处理
+// SOURCE_INFO() #func是字符串字面量的自动拼接
+#define CHECK_CALL(func, ...) check_error(SOURCE_INFO() #func, func(__VA_ARGS__))
+#define CHECK_CALL_EXCEPT(except,func, ...) check_error<except>(SOURCE_INFO() #func, func(__VA_ARGS__))
+
 
 struct address_resolver {
     struct address_ref {
@@ -127,14 +145,192 @@ std::vector<std::thread> pool;
 
 using StringMap = std::map<std::string,std::string>;
 
-//定义解析Http请求的类
+
+//只读字节流视图（char const *保证只读）
+struct bytes_const_view {
+    char const *m_data;
+    size_t m_size;
+
+    char const *data() const noexcept {
+        return m_data;
+    }
+
+    size_t size() const noexcept {
+        return m_size;
+    }
+
+    char const *begin() const noexcept {
+        return data();
+    }
+
+    char const *end() const noexcept {
+        return data() + size();
+    }
+
+    bytes_const_view subspan(size_t start, size_t len = static_cast<size_t>(-1)) const {
+        if (start > size())
+            throw std::out_of_range("bytes_const_view::subspan");
+        if (len > size() - start)
+            len = size() - start;
+        return {data() + start, len};
+    }
+
+    operator std::string_view() const noexcept {
+        return std::string_view{data(), size()};
+    }
+};
+
+
+//可读可写字节流视图
+struct bytes_view {
+    char *m_data;
+    size_t m_size;
+
+    char *data() const noexcept {
+        return m_data;
+    }
+
+    size_t size() const noexcept {
+        return m_size;
+    }
+
+    char *begin() const noexcept {
+        return data();
+    }
+
+    char *end() const noexcept {
+        return data() + size();
+    }
+
+    bytes_view subspan(size_t start, size_t len) const {
+        if (start > size())
+            throw std::out_of_range("bytes_view::subspan");
+        if (len > size() - start)
+            len = size() - start;
+        return {data() + start, len};
+    }
+
+    operator bytes_const_view() const noexcept {
+        return bytes_const_view{data(), size()};
+    }
+
+    operator std::string_view() const noexcept {
+        return std::string_view{data(), size()};
+    }
+};
+
+
+//可变大小的字节缓冲区
+struct bytes_buffer {
+    std::vector<char> m_data;
+
+    bytes_buffer() = default;
+    bytes_buffer(bytes_buffer &&) = default;                //移动构造
+    bytes_buffer &operator=(bytes_buffer &&) = default;     //移动赋值
+    explicit bytes_buffer(bytes_buffer const &) = default;  //显式构造
+
+    explicit bytes_buffer(size_t n) : m_data(n) {}
+
+    //char const * 只读指针，内容不可变
+    char const *data() const noexcept {
+        return m_data.data();
+    }
+
+    char *data() noexcept {
+        return m_data.data();
+    }
+
+    size_t size() const noexcept {
+        return m_data.size();
+    }
+
+    
+    //支持可读可写的迭代器
+    char const *begin() const noexcept {
+        return data();
+    }
+
+    char *begin() noexcept {
+        return data();
+    }
+
+    char const *end() const noexcept {
+        return data() + size();
+    }
+
+    char *end() noexcept {
+        return data() + size();
+    }
+
+    //支持可读/可写的子视图
+    //视图对象不持有数据，只是对数据的引用
+    //先类型转换成bytes_const_view，再创建视图
+    bytes_const_view subspan(size_t start, size_t len) const {
+        return operator bytes_const_view().subspan(start, len);
+    }
+
+    bytes_view subspan(size_t start, size_t len) {
+        return operator bytes_view().subspan(start, len);
+    }
+
+    //支持隐式类型转换
+    operator bytes_const_view() const noexcept {
+        return bytes_const_view{m_data.data(), m_data.size()};
+    }
+
+    operator bytes_view() noexcept {
+        return bytes_view{m_data.data(), m_data.size()};
+    }
+
+    operator std::string_view() const noexcept {
+        return std::string_view{m_data.data(), m_data.size()};
+    }
+
+    void append(bytes_const_view chunk) {
+        m_data.insert(m_data.end(), chunk.begin(), chunk.end());
+    }
+
+    void append(std::string_view chunk) {
+        m_data.insert(m_data.end(), chunk.begin(), chunk.end());
+    }
+
+    //追加字符串字面量，但 自动忽略末尾的 \0
+    template <size_t N>
+    void append_literial(const char (&literial)[N]) {
+        append(std::string_view{literial, N - 1});
+    }
+
+    void clear() {
+        m_data.clear();
+    }
+
+    void resize(size_t n) {
+        m_data.resize(n);
+    }
+
+    void reserve(size_t n) {
+        m_data.reserve(n);
+    }
+};
+
+
+
+//定义解析Http数据包的类
 //解决粘包问题
 struct http11_header_parser{
-    std::string m_header;       //整个header部分
-    std::string m_heading_line;  //一行一行的headerline部分
+    bytes_buffer m_header;       //整个header部分
+    std::string m_header_line;  //第一行的请求的包含方法名和http版本的headerline部分
     StringMap m_header_keys;    //存储首部行的kvpair
     std::string m_body;
     bool m_header_finished = false;
+
+    void reset_state() {
+        m_header.clear();
+        m_header_line.clear();
+        m_header_keys.clear();
+        m_body.clear();
+        m_header_finished = 0;
+    }
 
     [[nodiscard]] bool header_finished(){
         return m_header_finished;
@@ -176,7 +372,7 @@ struct http11_header_parser{
         }
     } 
 
-    void push_chunk(std::string_view chunk) {
+    void push_chunk(bytes_const_view chunk) {
         assert(!m_header_finished);
         size_t old_size = m_header.size();
         m_header.append(chunk);
@@ -199,14 +395,14 @@ struct http11_header_parser{
     }
 
     std::string &headline() {
-        return m_heading_line;
+        return m_header_line;
     }
 
     StringMap &headers() {
         return m_header_keys;
     }
 
-    std::string &headers_raw() {
+    bytes_buffer &headers_raw() {
         return m_header;
     }
 
@@ -215,69 +411,274 @@ struct http11_header_parser{
     }
 };
 
-template<class HeaderParser = http11_header_parser>
-struct http_request_parser{
+// 静态的固定长度的字节流的缓冲区
+// N是模板参数
+template <size_t N>
+struct static_bytes_buffer {
+    std::array<char, N> m_data;
+
+    char const *data() const noexcept {
+        return m_data.data();
+    }
+
+    char *data() noexcept {
+        return m_data.data();
+    }
+
+    static constexpr size_t size() noexcept {
+        return N;
+    }
+
+    operator bytes_const_view() const noexcept {
+        return bytes_const_view{m_data.data(), N};
+    }
+
+    operator bytes_view() noexcept {
+        return bytes_view{m_data.data(), N};
+    }
+
+    operator std::string_view() const noexcept {
+        return std::string_view{m_data.data(), m_data.size()};
+    }
+};
+
+
+//http请求和响应的数据包解析的基类，里面的HeaderParser头解析器共用http11_header_parser
+template <class HeaderParser = http11_header_parser>
+struct _http_base_parser {
     HeaderParser m_header_parser;
-    size_t m_content_length=0;
+    size_t m_content_length = 0;
+    size_t body_accumulated_size = 0;
     bool m_body_finished = false;
-    
-    //判断整个请求是否结束
-    [[nodiscard]] bool request_finished(){
+
+    void reset_state() {
+        m_header_parser.reset_state();
+        m_content_length = 0;
+        body_accumulated_size = 0;
+        m_body_finished = false;
+    }
+
+    [[nodiscard]] bool header_finished() {
+        return m_header_parser.header_finished();
+    }
+
+    [[nodiscard]] bool request_finished() {
         return m_body_finished;
     }
 
-    //获取请求body（for post）
-    std::string &body(){
+    std::string &headers_raw() {
+        return m_header_parser.headers_raw();
+    }
+
+    std::string &headline() {
+        return m_header_parser.headline();
+    }
+
+    StringMap &headers() {
+        return m_header_parser.headers();
+    }
+
+
+    //分别获取http请求/响应头headerline中的用空格分隔的三个部分
+    //eg:一般的http请求为：headerline = "GET /index.html HTTP/1.1" (method + url + version )
+    //响应为：headerline = "HTTP/1.1 200 OK"  (version + status + despcription)
+
+    std::string _headline_first() {
+        // "GET / HTTP/1.1" request
+        // "HTTP/1.1 200 OK" response
+        auto &line = headline();
+        size_t space = line.find(' ');
+        if (space == std::string::npos) {
+            return "";
+        }
+        return line.substr(0, space);
+    }
+
+    std::string _headline_second() {
+        // "GET / HTTP/1.1"
+        auto &line = headline();
+        size_t space1 = line.find(' ');
+        if (space1 != std::string::npos) {
+            return "";
+        }
+        size_t space2 = line.find(' ', space1);
+        if (space2 != std::string::npos) {
+            return "";
+        }
+        return line.substr(space1, space2);
+    }
+
+    std::string _headline_third() {
+        // "GET / HTTP/1.1"
+        auto &line = headline();
+        size_t space1 = line.find(' ');
+        if (space1 != std::string::npos) {
+            return "";
+        }
+        size_t space2 = line.find(' ', space1);
+        if (space2 != std::string::npos) {
+            return "";
+        }
+        return line.substr(space2);
+    }
+
+    std::string &body() {
         return m_header_parser.extra_body();
     }
 
-    size_t _extract_content_length(){
-        //取出请求中的headers的map
-        auto & headers = m_header_parser.headers();
+    size_t _extract_content_length() {
+        auto &headers = m_header_parser.headers();
         auto it = headers.find("content-length");
-
-        if(it == headers.end()){
-            //没找到直接返回默认值0
-            fmt::print("没找到content-length首部行\n");
+        if (it == headers.end()) {
             return 0;
         }
-        try{
-            fmt::print("找到了content-length首部行\n");
+        try {
             return std::stoi(it->second);
-        }catch(std::invalid_argument const&){
+        } catch (std::logic_error const &) {
             return 0;
         }
     }
 
-    void push_chunk(std::string_view chunk){
-        if(!m_header_parser.header_finished()){
-            //头部解析还没有完成
+    void push_chunk(bytes_const_view chunk) {
+        assert(!m_body_finished);
+        if (!m_header_parser.header_finished()) {
             m_header_parser.push_chunk(chunk);
-            if(m_header_parser.header_finished()){
-                fmt::print("头部已经解析完成，下一步获取正文长度\n");
+            if (m_header_parser.header_finished()) {
+                body_accumulated_size = body().size();
                 m_content_length = _extract_content_length();
-                fmt::print("content-length的值为：{}\n",m_content_length);
-                //防止body多读
-                if(body().size()>=m_content_length){
+                if (body_accumulated_size >= m_content_length) {
                     m_body_finished = true;
-                    body().resize(m_content_length);
                 }
             }
-        }else{
+        } else {
             body().append(chunk);
-            if(body().size()>=m_content_length){
+            body_accumulated_size += chunk.size();
+            if (body_accumulated_size >= m_content_length) {
                 m_body_finished = true;
-                body().resize(m_content_length);
             }
         }
-        
     }
 
+    std::string read_some_body() {
+        return std::move(body());
+    }
 };
 
-int main(){
-    //TCP基于stream的协议，容易出现粘包的问题
-    setlocale(LC_ALL,"zh_CN.UTF-8");    //将strerror的信息转换为中文
+//继承自基类base_parser的http_request_parser
+template <class HeaderParser = http11_header_parser>
+struct http_request_parser : _http_base_parser<HeaderParser> {
+    std::string method() {
+        return this->_headline_first();
+    }
+
+    std::string url() {
+        return this->_headline_second();
+    }
+
+    std::string http_version() {
+        return this->_headline_third();
+    }
+};
+
+//继承自基类base_parser的http_response_parser
+template <class HeaderParser = http11_header_parser>
+struct http_response_parser : _http_base_parser<HeaderParser> {
+    std::string http_version() {
+        return this->_headline_first();
+    }
+
+    int status() {
+        auto s = this->_headline_second();
+        try {
+            return std::stoi(s);
+        } catch (std::logic_error const &) {
+            return -1;
+        }
+    }
+
+    std::string status_string() {
+        return this->_headline_third();
+    }
+};
+
+// 构造http的数据包头的writer
+struct http11_header_writer {
+    bytes_buffer m_buffer;
+
+    void reset_state() {
+        m_buffer.clear();
+    }
+
+    bytes_buffer &buffer() {
+        return m_buffer;
+    }
+
+    void begin_header(std::string_view first, std::string_view second, std::string_view third) {
+        m_buffer.append(first);
+        m_buffer.append_literial(" ");
+        m_buffer.append(second);
+        m_buffer.append_literial(" ");
+        m_buffer.append(third);
+    }
+
+    void write_header(std::string_view key, std::string_view value) {
+        m_buffer.append_literial("\r\n");
+        m_buffer.append(key);
+        m_buffer.append_literial(": ");
+        m_buffer.append(value);
+    }
+
+    void end_header() {
+        m_buffer.append_literial("\r\n\r\n");
+    }
+};
+
+//http请求writer和响应writer的基类
+template <class HeaderWriter = http11_header_writer>
+struct _http_base_writer {
+    HeaderWriter m_header_writer;
+
+    void _begin_header(std::string_view first, std::string_view second, std::string_view third) {
+        m_header_writer.begin_header(first, second, third);
+    }
+
+    void reset_state() {
+        m_header_writer.reset_state();
+    }
+
+    bytes_buffer &buffer() {
+        return m_header_writer.buffer();
+    }
+
+    void write_header(std::string_view key, std::string_view value) {
+        m_header_writer.write_header(key, value);
+    }
+
+    void end_header() {
+        m_header_writer.end_header();
+    }
+
+    void write_body(std::string_view body) {
+        m_header_writer.buffer().append(body);
+    }
+};
+
+//这里实现response的parser和request的writer是为了实现中间代理服务器的功能
+template <class HeaderWriter = http11_header_writer>
+struct http_request_writer : _http_base_writer<HeaderWriter> {
+    void begin_header(int status) {
+        this->_begin_header("HTTP/1.1", std::to_string(status), "OK");
+    }
+};
+
+template <class HeaderWriter = http11_header_writer>
+struct http_response_writer : _http_base_writer<HeaderWriter> {
+    void begin_header(int status) {
+        this->_begin_header("HTTP/1.1", std::to_string(status), "OK");
+    }
+};
+
+void server(){
     fmt::print("正在监听：127.0.0.1:8080\n");
     address_resolver resolver;
     auto entry = resolver.resolve("127.0.0.1","8080");
@@ -290,31 +691,72 @@ int main(){
         address_resolver::address client_addr;
         int connid = CHECK_CALL(accept,listenfd,&client_addr.m_addr,&client_addr.m_addrlen);
         //必须按值(拷贝)进行捕获connid
+        fmt::print("接受了一个连接: {}\n",connid);
         pool.emplace_back(([connid]{
-            //operate the content readed
-            char buf[1024];
-            http_request_parser req_parser;
-            do{
-                size_t n = CHECK_CALL(read,connid,buf,sizeof(buf));
-                req_parser.push_chunk(std::string_view(buf,n));
+            bytes_buffer buf(1024);
+            while(true){
+                //operate the content readed
+                
+                http_request_parser req_parser;
+                do{
+                    size_t n = CHECK_CALL(read,connid,buf.data(),buf.size());
+                    //如果读到了EOF，说明对方关闭了http连接
+                    if(n==0){
+                        fmt::print("对面关闭连接\n");
+                        goto quit;
+                    }
+                    req_parser.push_chunk(buf.subspan(0,n));
 
-            }while(!req_parser.request_finished());
+                }while(!req_parser.request_finished());
 
-            fmt::print("收到请求头: {}\n",req_parser.m_header_parser.headers_raw());
-            fmt::print("收到请求正文: {}\n",req_parser.body());
+                fmt::print("收到请求头: {}\n",req_parser.m_header_parser.headers_raw());
+                fmt::print("收到请求正文: {}\n",req_parser.body());
 
-            std::string body = req_parser.body();
+                std::string body = req_parser.body();
 
-            // \r\n for newline in http header
-            // double \r\n for the end of http header
-            std::string res = "HTTP/1.1 200 OK\r\nServer: co_http\r\nConnection: close\r\nContent-length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+                if(body.empty()){
+                    body = "你好，你的请求正文为空";
+                }else{
+                    body = "你好，你的请求是:["+ body + "]";
+                }
 
-            fmt::print("我的答复是: {}\n",res);
-            CHECK_CALL(write,connid,res.data(),res.size());
+                http_response_writer res_writer;
+                res_writer.begin_header(200);
+                res_writer.write_header("Server","co_http");
+                res_writer.write_header("Content-type","text/html;charset=utf-8");
+                res_writer.write_header("Connection","keep-alive");
+                res_writer.write_header("Content-length",std::to_string(body.size()));
+                res_writer.end_header();
+                auto& buffer = res_writer.buffer();
+
+                //EPIPE 是 POSIX 系统（比如 Linux 和 macOS）中常见的一个错误代码，意思是：写入一个已经关闭的管道或套接字。
+                if(CHECK_CALL_EXCEPT(EPIPE,write,connid,buffer.data(),buffer.size())==-1){
+                    break;
+                }
+                if(CHECK_CALL_EXCEPT(EPIPE,write,connid,body.data(),body.size())==-1){
+                    break;
+                }
+
+                fmt::print("我的响应头: {}\n",buffer);
+                fmt::print("我的响应正文: {}\n",body);
+            }
+        quit:
             close(connid);
+            fmt::print("连接结束: {}\n",connid);
 
         }));
         
+    }
+}
+
+
+int main(){
+    //TCP基于stream的协议，容易出现粘包的问题
+    setlocale(LC_ALL,"zh_CN.UTF-8");    //将strerror的信息转换为中文
+    try{
+        server();
+    }catch(std::exception const&e){
+        fmt::print("错误: {}\n",e.what());
     }
 
     //调用join等待所有线程任务执行结束，主线程可能直接结束，导致子线程来不及完成工作，甚至程序异常终止
