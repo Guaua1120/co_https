@@ -234,13 +234,15 @@ struct http_request_parser{
     size_t _extract_content_length(){
         //取出请求中的headers的map
         auto & headers = m_header_parser.headers();
-        auto it = headers.find("content_length");
+        auto it = headers.find("content-length");
 
         if(it == headers.end()){
             //没找到直接返回默认值0
+            fmt::print("没找到content-length首部行\n");
             return 0;
         }
         try{
+            fmt::print("找到了content-length首部行\n");
             return std::stoi(it->second);
         }catch(std::invalid_argument const&){
             return 0;
@@ -252,7 +254,9 @@ struct http_request_parser{
             //头部解析还没有完成
             m_header_parser.push_chunk(chunk);
             if(m_header_parser.header_finished()){
+                fmt::print("头部已经解析完成，下一步获取正文长度\n");
                 m_content_length = _extract_content_length();
+                fmt::print("content-length的值为：{}\n",m_content_length);
                 //防止body多读
                 if(body().size()>=m_content_length){
                     m_body_finished = true;
