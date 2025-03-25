@@ -750,7 +750,7 @@ struct async_file{
         CHECK_CALL(fcntl,fd,F_SETFL,flags);
 
         struct epoll_event event;
-        event.events = EPOLLET;     //监听读取事件，设置边缘触发ET或者水平触发LT
+        event.events = EPOLLET;     //监听读取事件
         //  epoll control
         //  为连接注册epoll
         epoll_ctl(epollfd,EPOLL_CTL_ADD,fd,&event); 
@@ -766,11 +766,12 @@ struct async_file{
     //异步读取方法，非阻塞
     void async_read(bytes_view buf,callback<ssize_t> cb){
         ssize_t ret = CHECK_CALL_EXCEPT(EAGAIN,read,m_fd,buf.data(),buf.size());
-        if(ret!=-1){
+        if(ret!=-1){    
             cb(ret);
             return ;
         }
 
+        //ret==-1表示出现EAGAIN，需要等待数据到来，将事件放入监听队列中
         //如果read可以读了，请操作系统调用我的回调
         //回调函数绑定epoll
         callback<> resume = [this,buf,cb = std::move(cb)]() mutable{
@@ -778,8 +779,8 @@ struct async_file{
         };
 
         struct epoll_event event;
-        event.events = EPOLLIN | EPOLLET;    
-        event.data.ptr = resume.leak_address();     //刻意让resume产生内存泄漏
+        event.events = EPOLLIN | EPOLLET | EPOLLONESHOT ;       // 设置边缘触发ET或者水平触发LT 还有oneshot设置只生效一次
+        event.data.ptr = resume.leak_address();                 //刻意让resume产生内存泄漏
         epoll_ctl(epollfd,EPOLL_CTL_MOD,m_fd,&event); 
 
     }
@@ -798,6 +799,27 @@ struct async_file{
     //异步write操作
     void async_write(bytes_const_view buf,callback<ssize_t> cb){
         cb(CHECK_CALL(write,m_fd,buf.data(),buf.size()));
+    }
+
+    //异步接受连接操作
+    void async_accept(address_resolver::address & addr,callback<int>cb){
+        ssize_t ret = CHECK_CALL_EXCEPT(EAGAIN,accept,m_fd,&addr.m_addr,&addr.m_addrlen);
+        if(ret!=-1){    
+            cb(ret);
+            return ;
+        }
+
+        //如果accept可以进行连接了，请操作系统调用我的回调
+        //回调函数绑定epoll
+        callback<> resume = [this, &addr ,cb = std::move(cb)]() mutable{
+            async_accept(addr,std::move(cb));
+        };
+
+        struct epoll_event event;
+        event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;    
+        event.data.ptr = resume.leak_address();     //刻意让resume产生内存泄漏
+        epoll_ctl(epollfd,EPOLL_CTL_MOD,m_fd,&event); 
+
     }
 
     void close_file(){
@@ -870,28 +892,43 @@ struct http_connection_handler{
     }
 };
 
+//对accept进行异步化
+struct http_connection_accepter{
+    async_file m_listen;
+    address_resolver::address m_addr;
+
+    void do_start(std::string const name,std::string const  port){
+        address_resolver resolver;
+        fmt::print("正在监听：{}:{}\n",name,port);
+        auto entry = resolver.resolve(name,port);
+        //  在客户端开始listen后，操作系统开始监听连接请求，维护一个连接队列（backlog）
+        //  三次握手，服务端会把客户端的详细地址和端口放入连接队列中
+        //  调用accept时，操作系统会从内核队列中取出一个已经完成握手的连接，将地址存入clientaddr中并返回一个新的connfd作为文件描述符，完成握手开始通信
+        int listenfd = entry.create_socket_and_bind();  //监听文件描述符，与连接文件描述法不同，connid才可以进行读写
+
+        m_listen = async_file::async_wrap(listenfd);
+        do_accept();
+    }
+
+    void do_accept(){
+        //回调函数里面的connfd参数实际上是accept的函数返回值
+        m_listen.async_accept(m_addr,[this](int connfd){
+            fmt::print("接受了一个连接: {}\n",connfd);
+
+            http_connection_handler* conn_handler = new http_connection_handler{};
+            conn_handler->do_init(connfd);
+
+            do_accept();
+        });
+    }
+};
+
 
 void server(){
-    
-    address_resolver resolver;
-    fmt::print("正在监听：127.0.0.1:8080\n");
-    auto entry = resolver.resolve("127.0.0.1","8080");
-    //  在客户端开始listen后，操作系统开始监听连接请求，维护一个连接队列（backlog）
-    //  三次握手，服务端会把客户端的详细地址和端口放入连接队列中
-    //  调用accept时，操作系统会从内核队列中取出一个已经完成握手的连接，将地址存入clientaddr中并返回一个新的fd作为文件描述符，完成握手开始通信
-    int listenfd = entry.create_socket_and_bind();  //监听文件描述符，与连接文件描述法不同，connid才可以进行读写
-    
-    
-    address_resolver::address client_addr;
-    int connfd = CHECK_CALL(accept,listenfd,&client_addr.m_addr,&client_addr.m_addrlen);
-    //必须按值(拷贝)进行捕获connid
-    fmt::print("接受了一个连接: {}\n",connfd);
-
     //epollfd全局唯一
     epollfd = epoll_create1(0);
-
-    http_connection_handler* conn_handler = new http_connection_handler{};
-    conn_handler->do_init(connfd);
+    http_connection_accepter* acceptor = new http_connection_accepter();
+    acceptor->do_start("127.0.0.1","8080");
 
     struct epoll_event events[10];      //定义一个事件池
 
@@ -903,7 +940,7 @@ void server(){
         }
         for(int i=0;i<ret;i++){
             auto cb = callback<>::from_address(events[i].data.ptr);     //从泄漏内存中恢复对应的回调函数
-            cb();
+            cb();           //这里的回调函数可能是异步读取的回调函数，也可能是异步接受连接的回调函数
         }
 
     }
@@ -911,7 +948,6 @@ void server(){
 
     close(epollfd);
 }
-
 
 int main(){
     //TCP基于stream的协议，容易出现粘包的问题
