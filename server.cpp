@@ -12,7 +12,8 @@
 #include<string>
 #include<string_view>
 #include<map>
-#include <cassert>
+#include<cassert>
+#include<deque>
 
 
 std::error_category const &gai_category() {
@@ -140,8 +141,6 @@ struct address_resolver {
         }
     }
 };
-
-std::vector<std::thread> pool;
 
 using StringMap = std::map<std::string,std::string>;
 
@@ -678,75 +677,239 @@ struct http_response_writer : _http_base_writer<HeaderWriter> {
     }
 };
 
+
+// Args... 是一个 参数包,可以接受任意数量的模板参数
+template <class ...Args>
+struct callback {
+    struct _callback_base {
+        virtual void _call(Args... args) = 0;
+        virtual ~_callback_base() = default;
+    };
+
+    template <class F>
+    struct _callback_impl final : _callback_base {
+        F m_func;
+
+        template <class ...Ts, class = std::enable_if_t<std::is_constructible_v<F, Ts...>>>
+        _callback_impl(Ts &&...ts) : m_func(std::forward<Ts>(ts)...) {}
+
+        void _call(Args... args) override {
+            m_func(std::forward<Args>(args)...);
+        }
+    };
+
+    std::unique_ptr<_callback_base> m_base;
+
+    template <class F, class = std::enable_if_t<std::is_invocable_v<F, Args...> && !std::is_same_v<std::decay_t<F>, callback>>>
+    callback(F &&f) : m_base(std::make_unique<_callback_impl<std::decay_t<F>>>(std::forward<F>(f))) {}
+
+    callback() = default;
+
+    callback(callback const &) = delete;
+    callback &operator=(callback const &) = delete;
+    callback(callback &&) = default;
+    callback &operator=(callback &&) = default;
+
+    void operator()(Args... args) const {
+        assert(m_base);
+        return m_base->_call(std::forward<Args>(args)...);
+    }
+
+    template <class F>
+    F &target() const {
+        assert(m_base);
+        return static_cast<_callback_impl<F> &>(*m_base);
+    }
+
+    void *leak_address() {
+        return static_cast<void *>(m_base.release());
+    }
+
+    static callback from_address(void *addr) {
+        callback cb;
+        cb.m_base = std::unique_ptr<_callback_base>(static_cast<_callback_base *>(addr));
+        return cb;
+    }
+};
+
+int epollfd;
+
+// 封装了文件描述符的工具类
+// 单线程 + 回调 + 异步非阻塞IO 实现高并发
+// 只适用于网络这种IO密集型的场景下
+// 相当于用户态模拟对线程的调度（实际上只有单线程），降低了多线程之间上下文切换的巨大开销
+struct async_file{
+    int m_fd;
+    // callback<> m_resume;    //每个连接fd对应的回调函数，这样就不用维护回调函数的队列，事件触发是直接根据event.data.ptr定位回调函数执行即可
+
+    // 工厂函数，用于创建 async_file 对象
+    static async_file async_wrap(int fd){
+        int flags = CHECK_CALL(fcntl,fd,F_GETFL);
+        //将建立连接后的文件描述符增加非阻塞的属性
+        flags |=O_NONBLOCK;
+        CHECK_CALL(fcntl,fd,F_SETFL,flags);
+
+        struct epoll_event event;
+        event.events = EPOLLET;     //监听读取事件，设置边缘触发ET或者水平触发LT
+        //  epoll control
+        //  为连接注册epoll
+        epoll_ctl(epollfd,EPOLL_CTL_ADD,fd,&event); 
+
+        return async_file{fd};
+    }
+
+    //同步读取方法,会阻塞
+    ssize_t sync_read(bytes_view buf){
+        return CHECK_CALL(read,m_fd,buf.data(),buf.size());
+    }
+
+    //异步读取方法，非阻塞
+    void async_read(bytes_view buf,callback<ssize_t> cb){
+        ssize_t ret = CHECK_CALL_EXCEPT(EAGAIN,read,m_fd,buf.data(),buf.size());
+        if(ret!=-1){
+            cb(ret);
+            return ;
+        }
+
+        //如果read可以读了，请操作系统调用我的回调
+        //回调函数绑定epoll
+        callback<> resume = [this,buf,cb = std::move(cb)]() mutable{
+            async_read(buf,std::move(cb));
+        };
+
+        struct epoll_event event;
+        event.events = EPOLLIN | EPOLLET;    
+        event.data.ptr = resume.leak_address();     //刻意让resume产生内存泄漏
+        epoll_ctl(epollfd,EPOLL_CTL_MOD,m_fd,&event); 
+
+    }
+
+    //同步write方法，会阻塞
+    ssize_t sync_write(bytes_const_view buf){
+        ssize_t ret;
+        do {
+            //出现EAGAIN的错误，说明读取到的内容为空，需要再试一次而非阻塞
+            ret = CHECK_CALL_EXCEPT(EAGAIN,write,m_fd,buf.data(),buf.size());
+
+        }while(ret==-1);
+        return ret;
+    }
+
+    //异步write操作
+    void async_write(bytes_const_view buf,callback<ssize_t> cb){
+        cb(CHECK_CALL(write,m_fd,buf.data(),buf.size()));
+    }
+
+    void close_file(){
+        epoll_ctl(epollfd,EPOLL_CTL_DEL,m_fd,nullptr); 
+        close(m_fd);
+    }
+};
+
+struct http_connection_handler{
+    async_file m_conn;
+    bytes_buffer m_buf{1024};
+    http_request_parser<> m_req_parser;
+
+    void do_init(int connfd){
+        m_conn = async_file::async_wrap(connfd);
+        do_read();
+    }
+
+    void do_read(){
+        fmt::print("开始读取...\n");
+        m_conn.async_read(m_buf,[this](size_t n){
+            //如果读到了EOF，说明对方关闭了http连接
+            if(n==0){
+                fmt::print("对面关闭连接\n");
+                do_close();
+                return;
+            }
+            //成功读取，则推入解析
+            m_req_parser.push_chunk(m_buf.subspan(0,n));
+            fmt::print("收到请求头: {}\n",m_req_parser.m_header_parser.headers_raw());
+            fmt::print("收到请求正文: {}\n",m_req_parser.body());
+            if(!m_req_parser.request_finished()){
+                do_read();
+            }else{
+                do_write();
+            }
+        });
+    }
+
+    void do_write(){
+        std::string_view body = std::move(m_req_parser.body());
+        m_req_parser.reset_state();
+        http_response_writer res_writer;
+        
+        if(body.empty()){
+            body = "你好，你的请求正文为空";
+        }else{
+            body = fmt::format("你好，你的请求是：[{}],共{}字节",body,body.size());
+        }
+
+        res_writer.begin_header(200);
+        res_writer.write_header("Server","co_http");
+        res_writer.write_header("Content-type","text/html;charset=utf-8");
+        res_writer.write_header("Connection","keep-alive");
+        res_writer.write_header("Content-length",std::to_string(body.size()));
+        res_writer.end_header();
+        auto& buffer = res_writer.buffer();
+        
+        m_conn.sync_write(buffer);
+        m_conn.sync_write(bytes_const_view{body.data(),body.size()});
+        fmt::print("我的响应头: {}\n",buffer);
+        fmt::print("我的响应正文: {}\n",body);
+
+        do_read();
+    }
+
+    void do_close(){
+        m_conn.close_file();
+        delete this;
+    }
+};
+
+
 void server(){
-    fmt::print("正在监听：127.0.0.1:8080\n");
+    
     address_resolver resolver;
+    fmt::print("正在监听：127.0.0.1:8080\n");
     auto entry = resolver.resolve("127.0.0.1","8080");
     //  在客户端开始listen后，操作系统开始监听连接请求，维护一个连接队列（backlog）
     //  三次握手，服务端会把客户端的详细地址和端口放入连接队列中
-    //  调用accept时，操作系统会从内核队列中取出一个已经完成握手的连接，降低至存入clientaddr中并返回一个新的fd作为文件描述符，完成握手开始通信
+    //  调用accept时，操作系统会从内核队列中取出一个已经完成握手的连接，将地址存入clientaddr中并返回一个新的fd作为文件描述符，完成握手开始通信
     int listenfd = entry.create_socket_and_bind();  //监听文件描述符，与连接文件描述法不同，connid才可以进行读写
     
+    
+    address_resolver::address client_addr;
+    int connfd = CHECK_CALL(accept,listenfd,&client_addr.m_addr,&client_addr.m_addrlen);
+    //必须按值(拷贝)进行捕获connid
+    fmt::print("接受了一个连接: {}\n",connfd);
+
+    //epollfd全局唯一
+    epollfd = epoll_create1(0);
+
+    http_connection_handler* conn_handler = new http_connection_handler{};
+    conn_handler->do_init(connfd);
+
+    struct epoll_event events[10];      //定义一个事件池
+
     while(true){
-        address_resolver::address client_addr;
-        int connid = CHECK_CALL(accept,listenfd,&client_addr.m_addr,&client_addr.m_addrlen);
-        //必须按值(拷贝)进行捕获connid
-        fmt::print("接受了一个连接: {}\n",connid);
-        pool.emplace_back(([connid]{
-            bytes_buffer buf(1024);
-            while(true){
-                //operate the content readed
-                
-                http_request_parser req_parser;
-                do{
-                    size_t n = CHECK_CALL(read,connid,buf.data(),buf.size());
-                    //如果读到了EOF，说明对方关闭了http连接
-                    if(n==0){
-                        fmt::print("对面关闭连接\n");
-                        goto quit;
-                    }
-                    req_parser.push_chunk(buf.subspan(0,n));
+        int ret =  epoll_wait(epollfd,events,10,-1);   //events为监听的时间列表，10为最大监听数量，-1为最长监听时间（ms）,-1代表永远监听
+        //返回值表示events的有效列表（events[0..ret-1]），负数则抛出异常
+        if(ret < 0){
+            throw;
+        }
+        for(int i=0;i<ret;i++){
+            auto cb = callback<>::from_address(events[i].data.ptr);     //从泄漏内存中恢复对应的回调函数
+            cb();
+        }
 
-                }while(!req_parser.request_finished());
-
-                fmt::print("收到请求头: {}\n",req_parser.m_header_parser.headers_raw());
-                fmt::print("收到请求正文: {}\n",req_parser.body());
-
-                std::string body = req_parser.body();
-
-                if(body.empty()){
-                    body = "你好，你的请求正文为空";
-                }else{
-                    body = "你好，你的请求是:["+ body + "]";
-                }
-
-                http_response_writer res_writer;
-                res_writer.begin_header(200);
-                res_writer.write_header("Server","co_http");
-                res_writer.write_header("Content-type","text/html;charset=utf-8");
-                res_writer.write_header("Connection","keep-alive");
-                res_writer.write_header("Content-length",std::to_string(body.size()));
-                res_writer.end_header();
-                auto& buffer = res_writer.buffer();
-
-                //EPIPE 是 POSIX 系统（比如 Linux 和 macOS）中常见的一个错误代码，意思是：写入一个已经关闭的管道或套接字。
-                if(CHECK_CALL_EXCEPT(EPIPE,write,connid,buffer.data(),buffer.size())==-1){
-                    break;
-                }
-                if(CHECK_CALL_EXCEPT(EPIPE,write,connid,body.data(),body.size())==-1){
-                    break;
-                }
-
-                fmt::print("我的响应头: {}\n",buffer);
-                fmt::print("我的响应正文: {}\n",body);
-            }
-        quit:
-            close(connid);
-            fmt::print("连接结束: {}\n",connid);
-
-        }));
-        
     }
+    fmt::print("所有任务都已完成\n");
+
+    close(epollfd);
 }
 
 
@@ -758,12 +921,5 @@ int main(){
     }catch(std::exception const&e){
         fmt::print("错误: {}\n",e.what());
     }
-
-    //调用join等待所有线程任务执行结束，主线程可能直接结束，导致子线程来不及完成工作，甚至程序异常终止
-    for(auto&t:pool){
-        t.join();
-    }
     return 0;
-    
-    
 } 
