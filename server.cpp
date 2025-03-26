@@ -32,7 +32,7 @@ std::error_category const &gai_category() {
 
 [[noreturn]] void _throw_system_error(const char *what) {
     auto ec = std::error_code(errno, std::system_category());
-    fmt::print(stderr, "{}: {} ({}.{})\n", what, ec.message(), ec.category().name(), ec.value());
+    //fmt::print(stderr, "{}: {} ({}.{})\n", what, ec.message(), ec.category().name(), ec.value());
     throw std::system_error(ec, what);
 }
 
@@ -48,7 +48,7 @@ T check_error(const char* what ,T res){
             }
         }
         auto ec = std::error_code(errno,std::system_category());
-        fmt::print(stderr,"{}: {}\n",what,ec.message());
+        //fmt::print(stderr,"{}: {}\n",what,ec.message());
         _throw_system_error(what);
     }
     return res;
@@ -798,7 +798,24 @@ struct async_file{
 
     //异步write操作
     void async_write(bytes_const_view buf,callback<ssize_t> cb){
-        cb(CHECK_CALL(write,m_fd,buf.data(),buf.size()));
+        ssize_t ret = CHECK_CALL_EXCEPT(EAGAIN,write,m_fd,buf.data(),buf.size());
+        if(ret!=-1){    
+            cb(ret);
+            return ;
+        }
+
+        //ret==-1表示出现EAGAIN，需要等待数据到来，将事件放入监听队列中
+        //如果write可以写了，请操作系统调用我的回调
+        //回调函数绑定epoll
+        callback<> resume = [this,buf,cb = std::move(cb)]() mutable{
+            async_write(buf,std::move(cb));
+        };
+
+        struct epoll_event event;
+        event.events = EPOLLOUT | EPOLLET | EPOLLONESHOT ;       // 设置边缘触发ET或者水平触发LT 还有oneshot设置只生效一次
+        event.data.ptr = resume.leak_address();                 //  刻意让resume产生内存泄漏
+        epoll_ctl(epollfd,EPOLL_CTL_MOD,m_fd,&event); 
+
     }
 
     //异步接受连接操作
@@ -839,18 +856,18 @@ struct http_connection_handler{
     }
 
     void do_read(){
-        fmt::print("开始读取...\n");
+        //fmt::print("开始读取...\n");
         m_conn.async_read(m_buf,[this](size_t n){
             //如果读到了EOF，说明对方关闭了http连接
             if(n==0){
-                fmt::print("对面关闭连接\n");
+                //fmt::print("对面关闭连接\n");
                 do_close();
                 return;
             }
             //成功读取，则推入解析
             m_req_parser.push_chunk(m_buf.subspan(0,n));
-            fmt::print("收到请求头: {}\n",m_req_parser.m_header_parser.headers_raw());
-            fmt::print("收到请求正文: {}\n",m_req_parser.body());
+            //fmt::print("收到请求头: {}\n",m_req_parser.m_header_parser.headers_raw());
+            //fmt::print("收到请求正文: {}\n",m_req_parser.body());
             if(!m_req_parser.request_finished()){
                 do_read();
             }else{
@@ -878,10 +895,11 @@ struct http_connection_handler{
         res_writer.end_header();
         auto& buffer = res_writer.buffer();
         
-        m_conn.sync_write(buffer);
-        m_conn.sync_write(bytes_const_view{body.data(),body.size()});
-        fmt::print("我的响应头: {}\n",buffer);
-        fmt::print("我的响应正文: {}\n",body);
+        buffer.append(body);
+        m_conn.async_write(buffer,[this](size_t n){
+            do_read();
+        });
+
 
         do_read();
     }
@@ -899,7 +917,7 @@ struct http_connection_accepter{
 
     void do_start(std::string const name,std::string const  port){
         address_resolver resolver;
-        fmt::print("正在监听：{}:{}\n",name,port);
+        //fmt::print("正在监听：{}:{}\n",name,port);
         auto entry = resolver.resolve(name,port);
         //  在客户端开始listen后，操作系统开始监听连接请求，维护一个连接队列（backlog）
         //  三次握手，服务端会把客户端的详细地址和端口放入连接队列中
@@ -913,7 +931,7 @@ struct http_connection_accepter{
     void do_accept(){
         //回调函数里面的connfd参数实际上是accept的函数返回值
         m_listen.async_accept(m_addr,[this](int connfd){
-            fmt::print("接受了一个连接: {}\n",connfd);
+            //fmt::print("接受了一个连接: {}\n",connfd);
 
             http_connection_handler* conn_handler = new http_connection_handler{};
             conn_handler->do_init(connfd);
@@ -930,10 +948,10 @@ void server(){
     http_connection_accepter* acceptor = new http_connection_accepter();
     acceptor->do_start("127.0.0.1","8080");
 
-    struct epoll_event events[10];      //定义一个事件池
+    struct epoll_event events[256];      //定义一个事件池
 
     while(true){
-        int ret =  epoll_wait(epollfd,events,10,-1);   //events为监听的时间列表，10为最大监听数量，-1为最长监听时间（ms）,-1代表永远监听
+        int ret =  epoll_wait(epollfd,events,256,-1);   //events为监听的时间列表，10为最大监听数量，-1为最长监听时间（ms）,-1代表永远监听
         //返回值表示events的有效列表（events[0..ret-1]），负数则抛出异常
         if(ret < 0){
             throw;
@@ -944,7 +962,7 @@ void server(){
         }
 
     }
-    fmt::print("所有任务都已完成\n");
+    //fmt::print("所有任务都已完成\n");
 
     close(epollfd);
 }
